@@ -87,6 +87,10 @@ NodeConfig NodeConfig::parseFromFile(const std::string& filePath) {
             config.heartbeatTimeoutMs = std::stoi(value);
         } else if (key == "auto_promote") {
             config.autoPromote = (value == "true" || value == "1");
+        } else if (key == "replication_queue_max_size") {
+            config.replicationQueueMaxSize = std::stoi(value);
+        } else if (key == "replication_send_buffer_size") {
+            config.replicationSendBufferSize = std::stoi(value);
         } else {
             throw std::runtime_error("Unknown config key: " + key);
         }

@@ -18,6 +18,9 @@
 #   test_step6_replication_protocol
 #     + integration                     -> test_replication_catchup (leader<->follower replication + catch-up)
 #   test_step7_protocol + integration   -> test_leader_failover (heartbeat timeout + manual promotion)
+#   test_step8_backpressure_integration -> bounded per-follower replication queue + disconnect-on-overflow
+#   test_step9_consistent_hash_ring     -> ConsistentHashRing: deterministic assignment, distribution, remap-on-resize
+#   test_step9_sharding_integration     -> Router + multiple shard leaders: partitioning, PROMOTE rejection, dead-shard handling
 
 set -u  # treat unset variables as errors; deliberately not -e, since we
         # want to run every test and report a full summary even if one fails
@@ -75,6 +78,7 @@ fi
 # Clean up any state left over from a previous run, and any stray
 # server processes, so every run starts from a known-clean slate.
 pkill -9 kv_node 2>/dev/null
+pkill -9 router 2>/dev/null
 sleep 0.3
 rm -f "$PROJECT_ROOT"/*.log
 rm -f "$PROJECT_ROOT"/data/*.wal
@@ -108,6 +112,7 @@ run_integration_test() {
     echo ""
     echo "=== $name ==="
     pkill -9 kv_node 2>/dev/null
+    pkill -9 router 2>/dev/null
     sleep 0.3
     local ok=0
     if [ -n "$TIMEOUT_CMD" ]; then
@@ -130,6 +135,7 @@ run_integration_test() {
         FAILED_NAMES+=("$name")
     fi
     pkill -9 kv_node 2>/dev/null
+    pkill -9 router 2>/dev/null
 }
 
 # ---------------------------------------------------------------------
@@ -145,6 +151,7 @@ run_unit_test test_step4_node
 run_unit_test test_step5_protocol
 run_unit_test test_step6_replication_protocol
 run_unit_test test_step7_protocol
+run_unit_test test_step9_consistent_hash_ring
 
 # ---------------------------------------------------------------------
 # Integration tests (real kv_node processes, real TCP, real signals)
@@ -156,6 +163,8 @@ echo "########################################"
 run_integration_test test_step5_integration.py "$BUILD_DIR/kv_node" config/single_node.conf
 run_integration_test test_step6_integration.py "$BUILD_DIR/kv_node" config/leader.conf config/follower1.conf
 run_integration_test test_step7_integration.py "$BUILD_DIR/kv_node" config/leader.conf config/follower1.conf
+run_integration_test test_step8_backpressure_integration.py "$BUILD_DIR/kv_node" config/leader_backpressure.conf config/follower_backpressure.conf
+run_integration_test test_step9_sharding_integration.py "$BUILD_DIR/kv_node" "$BUILD_DIR/router" config/shard1.conf config/shard2.conf config/cluster.conf
 
 # ---------------------------------------------------------------------
 # Summary

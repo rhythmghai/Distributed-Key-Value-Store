@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <chrono>
+#include <sys/socket.h>
 
 namespace {
 int64_t nowMillis() {
@@ -144,11 +145,33 @@ NodeRole Node::currentRole() const {
 void Node::replicateToFollowers(const LogEntry& entry) {
     std::lock_guard<std::mutex> lock(followersMutex_);
     for (auto& conn : followers_) {
-        std::lock_guard<std::mutex> connLock(conn->mutex);
-        if (!conn->alive) continue;
-        conn->pending.push(OutboundMessage{OutboundMessage::Kind::REPL, entry});
-        conn->cv.notify_one();
+        enqueueToFollower(conn, OutboundMessage{OutboundMessage::Kind::REPL, entry});
     }
+}
+
+void Node::enqueueToFollower(const std::shared_ptr<FollowerConnection>& conn, OutboundMessage msg) {
+    std::lock_guard<std::mutex> connLock(conn->mutex);
+    if (!conn->alive) return;
+
+    if (conn->pending.size() >= static_cast<size_t>(config_.replicationQueueMaxSize)) {
+        // Back pressure: this follower isn't draining its queue fast
+        // enough to keep up. Drop it rather than let the queue grow
+        // without bound -- see the doc comment on the declaration for
+        // why drop-oldest isn't an option here.
+        conn->alive = false;
+        conn->cv.notify_one(); // wakes the drain loop so it can tear down and close the socket
+        if (logger_ != nullptr) {
+            std::ostringstream details;
+            details << "fd=" << conn->fd
+                    << " queue_size=" << conn->pending.size()
+                    << " max=" << config_.replicationQueueMaxSize;
+            logger_->log(EventType::REPLICATION_BACKPRESSURE_DISCONNECT, details.str());
+        }
+        return;
+    }
+
+    conn->pending.push(std::move(msg));
+    conn->cv.notify_one();
 }
 
 void Node::startHeartbeatSenderIfLeader() {
@@ -168,15 +191,20 @@ void Node::runHeartbeatSenderLoop() {
 
         std::lock_guard<std::mutex> lock(followersMutex_);
         for (auto& conn : followers_) {
-            std::lock_guard<std::mutex> connLock(conn->mutex);
-            if (!conn->alive) continue;
-            conn->pending.push(OutboundMessage{OutboundMessage::Kind::HEARTBEAT, LogEntry{}});
-            conn->cv.notify_one();
+            enqueueToFollower(conn, OutboundMessage{OutboundMessage::Kind::HEARTBEAT, LogEntry{}});
         }
     }
 }
 
 void Node::registerAndServeFollower(int followerFd, uint64_t followerLastSeq) {
+    if (config_.replicationSendBufferSize > 0) {
+        // Best-effort: the OS may clamp or ignore this. Purely a testing
+        // aid so back-pressure can be exercised without needing enough
+        // traffic to fill the (often 100KB+) OS default send buffer.
+        int sndBufSize = config_.replicationSendBufferSize;
+        setsockopt(followerFd, SOL_SOCKET, SO_SNDBUF, &sndBufSize, sizeof(sndBufSize));
+    }
+
     std::vector<LogEntry> catchupEntries;
     auto conn = std::make_shared<FollowerConnection>();
     conn->fd = followerFd;

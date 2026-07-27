@@ -38,7 +38,10 @@
 // catch-up entries + REPL_DONE, then blocks draining a per-follower
 // queue and pushing REPL messages for the lifetime of the connection.
 // put()/remove() push newly-written entries into every registered
-// follower's queue (non-blocking) as their last step.
+// follower's queue (non-blocking) as their last step. That queue is
+// bounded (NodeConfig::replicationQueueMaxSize): a follower that can't
+// drain it fast enough gets disconnected rather than left to grow
+// without bound -- see Node::enqueueToFollower.
 //
 // Follower-side replication model: startFollowerReplication() spawns a
 // background thread that connects to the leader, sends SYNC_REQUEST
@@ -148,6 +151,20 @@ private:
     // same order they were committed locally.
     void replicateToFollowers(const LogEntry& entry);
     void runHeartbeatSenderLoop();
+
+    // Shared enqueue path for both replicated writes and heartbeats, so
+    // they get identical back-pressure handling instead of duplicating
+    // the bounds check. If conn's queue is already at
+    // config_.replicationQueueMaxSize, does NOT drop the oldest entry
+    // and keep going -- that would silently open a permanent gap in
+    // this follower's replication stream (followers only accept the
+    // exact next seq; no gap-filling, see applyReplicatedEntry). Instead
+    // marks the connection dead and lets registerAndServeFollower's
+    // drain loop notice and tear it down, same as any other follower
+    // outage -- it just reconnects and catches up via SYNC_REQUEST.
+    // Never blocks: callers include put()/remove(), which hold
+    // writeMutex_, so a slow follower must never stall a client's ack.
+    void enqueueToFollower(const std::shared_ptr<FollowerConnection>& conn, OutboundMessage msg);
 
     // --- Follower-side replication + heartbeat monitor state ---
     std::thread followerReplicationThread_;

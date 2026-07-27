@@ -24,6 +24,7 @@ std::string eventTypeToString(EventType type) {
         case EventType::HEARTBEAT_RECEIVED: return "HEARTBEAT_RECEIVED";
         case EventType::HEARTBEAT_TIMEOUT: return "HEARTBEAT_TIMEOUT";
         case EventType::NODE_PROMOTED: return "NODE_PROMOTED";
+        case EventType::REPLICATION_BACKPRESSURE_DISCONNECT: return "REPLICATION_BACKPRESSURE_DISCONNECT";
         case EventType::ERROR: return "ERROR";
     }
     return "UNKNOWN_EVENT";

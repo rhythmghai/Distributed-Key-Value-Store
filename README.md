@@ -35,13 +35,28 @@ lines were drawn, and why.
 - **Manual failover**: a follower can be promoted to leader on command,
   and correctly starts serving writes with data and sequence numbering
   intact.
+- **Replication back-pressure**: each follower's outbound queue on the
+  leader is bounded (`replication_queue_max_size`); a follower that can't
+  drain it fast enough is disconnected rather than left to grow the
+  queue without bound (an unbounded queue is a memory-leak / DoS risk in
+  a real system). This never blocks a client's write — the check is
+  purely a queue-length comparison on the enqueue side, not a wait on
+  the slow follower — and dropping the follower is safe because it
+  reconnects and catches up via the existing `SYNC_REQUEST` flow, same
+  as any other follower outage.
+- **Sharding via consistent hashing**: a Router process fronts multiple
+  independent leader-groups ("shards"), each an ordinary leader (plus
+  however many followers it wants) reused exactly as-is, and routes each
+  request to the shard that owns its key via a consistent-hashing ring
+  — see [Sharding](#sharding) below.
 
 ## Architecture
 
 ```
 distributed-kv-store/
 ├── CMakeLists.txt
-├── config/                  # example node configs (leader/follower/single-node)
+├── config/                  # example node configs (leader/follower/single-node), plus
+│                             # shard leader configs and cluster.conf for the Router
 ├── include/, src/            # see module breakdown below
 └── tests/                    # unit tests (pure logic) + integration tests (real processes)
 ```
@@ -50,7 +65,7 @@ distributed-kv-store/
 
 | Module | Responsibility |
 |---|---|
-| `NodeConfig` | Parses a node's config file (role, ports, WAL path, peer addresses, heartbeat tuning) |
+| `NodeConfig` | Parses a node's config file (role, ports, WAL path, peer addresses, heartbeat tuning, replication back-pressure tuning) |
 | `Logger` | Structured, timestamped event logging (`WAL_APPENDED`, `HEARTBEAT_TIMEOUT`, `NODE_PROMOTED`, etc.) |
 | `KVStore` | Pure in-memory map. Deliberately has zero knowledge of durability, sequencing, or networking. |
 | `LogEntry` | One WAL/replication record; length-prefixed serialization so keys/values can safely contain spaces |
@@ -61,6 +76,9 @@ distributed-kv-store/
 | `ClientProtocolHandler` | Parses/formats the client wire protocol (`PUT`/`GET`/`DELETE`/`PROMOTE`) |
 | `ReplicationProtocolHandler` | Parses/formats the replication wire protocol (`REPL`/`SYNC_REQUEST`/`REPL_DONE`/`HEARTBEAT`) |
 | `socket_utils` | Shared newline-delimited read/write helpers over raw fds |
+| `ConsistentHashRing` | Pure hashing-ring logic: virtual nodes, `getShardForKey`, `addShard`/`removeShard` — no sockets, no knowledge of Router/Node |
+| `RouterConfig` | Parses the Router's `cluster.conf` (listen port + `shard_id:host:port` entries) |
+| Router (`router_main.cpp`) | Accepts client connections (via `TcpServer`), parses requests (via `ClientProtocolHandler`), routes each to the owning shard's leader (via `ConsistentHashRing` + `TcpClient`), relays the response back |
 
 ### Thread model
 
@@ -70,13 +88,21 @@ Per node process:
 - **Replication-serving thread** (leader) — the same thread that accepted a
   follower's `SYNC_REQUEST` connection stays alive for that connection's
   lifetime, draining a per-follower queue and pushing `REPL`/`HEARTBEAT`
-  messages
+  messages. That queue is bounded (`replication_queue_max_size`); if a
+  follower can't drain it in time, the connection is torn down instead of
+  letting the queue grow forever
 - **Replication-receive thread** (follower) — connects out to the leader,
   handles catch-up, then loops applying live `REPL` messages
 - **Heartbeat-sender thread** (leader) — periodically enqueues a heartbeat to
   every registered follower connection
 - **Heartbeat-monitor thread** (follower) — independently checks elapsed
   time since the last message from the leader, flags a timeout
+
+The Router is a separate, simpler process: an accept thread plus one
+client-handler thread per connection, same as a Node's client-facing side
+— but each request additionally opens a short-lived `TcpClient` connection
+out to the owning shard's leader, forwards the request, and relays back
+whatever it gets (or an `ERROR` line if the shard can't be reached).
 
 Locking is coarse-grained by design: a single `writeMutex_` guards
 "assign sequence number → append to WAL → apply to store → enqueue for
@@ -144,6 +170,34 @@ store — *before* any follower has necessarily received it. This is what
 makes the system's consistency model **eventual, not strong** — a follower
 may briefly lag, and this is by design.
 
+### Replication back-pressure
+
+Step 7 (enqueue only, never block the sender) leaves one gap: what happens
+if a follower never drains its queue? Left unbounded, that queue grows for
+as long as the follower stays stuck — a memory leak, and a DoS vector if a
+follower can be made to hang. Two leader-only config keys control this:
+
+```
+replication_queue_max_size=1000     # max pending messages per follower
+replication_send_buffer_size=-1     # SO_SNDBUF override; -1 = OS default
+```
+
+When a follower's queue reaches `replication_queue_max_size`, the leader
+disconnects that follower rather than dropping its oldest queued entry —
+dropping would silently open a permanent gap in that follower's replication
+stream, which it can never recover from (followers only accept the exact
+next sequence number; there's no gap-filling). Disconnecting instead reuses
+the existing, already-tested recovery path: the follower reconnects and
+catches up via `SYNC_REQUEST`, indistinguishable from any other outage.
+The bounds check is a queue-length comparison done at enqueue time — it
+never waits on the follower, so a stuck follower still can't delay a
+client's write acknowledgment.
+
+`replication_send_buffer_size` shrinks the accepted follower socket's
+`SO_SNDBUF`; it exists purely to make back-pressure testable without
+needing to push an unrealistic amount of traffic through the OS's default
+(often 100KB+) send buffer first.
+
 ### Recovery / catch-up semantics
 
 - On restart, a node replays its own WAL and resumes sequence numbering from
@@ -157,6 +211,86 @@ may briefly lag, and this is by design.
   (`seq > next_expected`, i.e. a gap) rather than corrupting state.
 - A truncated/corrupt final WAL line (e.g. process killed mid-`fwrite`) is
   detected and discarded on replay rather than crashing recovery.
+
+## Sharding
+
+Everything above describes one **shard**: a single leader-group (a leader
+plus however many followers) that owns the *entire* keyspace it's given.
+Sharding adds a routing layer in front of multiple independent shards, each
+one exactly that same leader-group, unmodified — replication, WAL,
+heartbeats, and promotion all work identically per-shard, reused as-is.
+Splitting the keyspace across shards, and finding the right one, is
+entirely new code layered on top; nothing about `Node` changed to support it.
+
+### The ring
+
+`ConsistentHashRing` (pure logic, no sockets) is a sorted map from a 64-bit
+hash to a shard ID. Each shard gets `kVirtualNodesPerShard` (150) points
+scattered around the ring — hashing `"<shard_id>#<vnode_index>"` for each —
+rather than a single point per shard, so shards end up with roughly even
+coverage despite the underlying placement being effectively random. Looking
+up a key is `hash(key)`, then the first ring entry at or after that hash
+(`std::map::lower_bound`), wrapping around to the ring's first entry if the
+key hashes past every virtual node — an ordinary circular ring.
+
+The hash itself is a hand-rolled 64-bit FNV-1a, run through a standard
+avalanche finalizer (MurmurHash3's `fmix64`) afterward. The finalizer isn't
+optional polish: plain FNV-1a alone produces near-arithmetic-progression
+hashes for inputs that differ only in a small trailing byte — exactly the
+shape of `"shard-1#0"`, `"shard-1#1"`, ... — which clustered an entire
+shard's virtual nodes into one tiny arc of the ring instead of spreading
+them around it (caught by the distribution unit test; see
+`tests/test_step9_consistent_hash_ring.cpp` for the regression guard). Both
+the hash and the ring's construction are fully deterministic, so the same
+key always maps to the same shard given the same ring membership, on any
+machine.
+
+`addShard`/`removeShard` only change ring membership going forward — see
+[Current Limitations](#current-limitations) for what that doesn't do.
+
+### cluster.conf
+
+The Router reads a separate config file (distinct from a Node's config)
+listing its own listen port and every shard's leader address:
+
+```
+router_listen_port=8000
+shard=shard-1:127.0.0.1:9000
+shard=shard-2:127.0.0.1:9010
+```
+
+Each `shard=` line is `<shard_id>:<leader_host>:<leader_port>` — the address
+of that shard's leader, itself just an ordinary node started from its own
+`leader.conf`-style config (with whatever followers it wants; the Router
+has no knowledge of followers at all and never talks to them).
+
+### Request flow
+
+Clients only ever talk to the Router's port, using the exact same
+`PUT`/`GET`/`DELETE`/`PROMOTE` protocol as talking to a Node directly (same
+`ClientProtocolHandler`, reused unmodified). For each request line, the
+Router:
+
+1. Parses it to extract the key (for `PUT`/`GET`/`DELETE`).
+2. Looks up the owning shard via the ring.
+3. Opens a short-lived `TcpClient` connection to that shard's leader,
+   forwards the *original* request line verbatim, and reads exactly one
+   response line back.
+4. Relays that response to the original client.
+
+Reads go to the shard's leader too, same as writes — the Router does not
+route reads to followers to spread load (see Future Enhancements). A
+connection is opened fresh per request rather than pooled per shard —
+simple and correct at this project's scale, at the cost of a
+connect-per-request; connection pooling is noted as a future enhancement
+rather than built now.
+
+`PROMOTE` has no associated key, so there's nothing for the Router to route
+it to — it's rejected outright with a clear error asking the caller to
+contact a shard's node directly. If forwarding to a shard's leader fails
+(connection refused, the shard is down, etc.), the Router returns a clear
+`ERROR` line to the client rather than hanging or crashing; every other
+shard keeps working normally.
 
 ## Assumptions
 
@@ -175,20 +309,34 @@ may briefly lag, and this is by design.
   (A real system would use a term/epoch number, as Raft does, so a node can
   tell it's talking to a stale leader.)
 - No WAL compaction or snapshotting — the log grows unboundedly.
-- Single leader only; no multi-leader writes.
+- Single leader per shard; no multi-leader writes within a shard.
 - No TLS or authentication on any socket.
 - `PROMOTE` is exposed on the client-data port rather than a separate
   admin channel.
+- The Router is a new single point of failure: every client request goes
+  through it, and there's exactly one (no Router replication or failover —
+  same spirit as the old-leader-comes-back limitation above: this design
+  has no mechanism for a second Router or for detecting/handling one going
+  down, it would just take the whole cluster's client traffic with it).
+- `addShard`/`removeShard` on `ConsistentHashRing` only change ring
+  membership going forward — keys that remap as a result are **not**
+  migrated between shards. A real system would need to copy the affected
+  keys to (or off) the shard as part of that operation; here it's purely a
+  routing-table change.
 
 ## Future Enhancements
 
 - Raft-based leader election with quorum voting
 - Snapshotting and WAL compaction
 - Synchronous (or configurable quorum-ack) replication
-- Sharding via consistent hashing across multiple leader-groups
 - TLS and authentication
 - Binary serialization (e.g. Protocol Buffers) instead of the current
   newline-delimited text protocol
+- Read routing to followers for load distribution (the Router currently
+  sends every request, reads included, to a shard's leader)
+- Live data migration on shard add/remove, so `ConsistentHashRing`
+  membership changes actually move the remapped keys instead of just
+  changing where new requests for them are routed
 
 ## Building
 
@@ -200,9 +348,10 @@ cmake ..
 make
 ```
 
-This produces the `kv_node` binary plus one test binary per build step
-(`test_step1_2`, `test_step3_wal`, `test_step4_node`, `test_step5_protocol`,
-`test_step6_replication_protocol`, `test_step7_protocol`).
+This produces the `kv_node` and `router` binaries, plus one test binary per
+build step (`test_step1_2`, `test_step3_wal`, `test_step4_node`,
+`test_step5_protocol`, `test_step6_replication_protocol`,
+`test_step7_protocol`, `test_step9_consistent_hash_ring`).
 
 ## Running
 
@@ -233,6 +382,25 @@ nc localhost 9001   # talk to the follower: GET works, PUT/DELETE are rejected
 #   send PROMOTE to the follower's port (e.g. via `nc localhost 9001`)
 ```
 
+**Sharded cluster** (two shard leaders + a Router, three terminals):
+```bash
+# terminal 1
+./build/kv_node config/shard1.conf
+# terminal 2
+./build/kv_node config/shard2.conf
+# terminal 3
+./build/router config/cluster.conf
+```
+
+Then, from a fourth terminal, talk only to the Router:
+```bash
+nc localhost 8000
+PUT name Rhythm
+GET name
+```
+`GET`/`PUT`/`DELETE` against `localhost 9000` or `9010` directly show that
+the key only actually landed on one of the two shards.
+
 ## Testing
 
 Run everything (build + all unit tests + all integration tests) with one
@@ -260,3 +428,6 @@ python3 tests/test_step6_integration.py build/kv_node config/leader.conf config/
 | `test_step5_protocol` + `test_step5_integration.py` | Client wire protocol; real TCP + `SIGKILL` crash recovery |
 | `test_step6_replication_protocol` + `test_step6_integration.py` | Leader↔follower replication, follower crash + catch-up, write rejection on followers |
 | `test_step7_protocol` + `test_step7_integration.py` | Heartbeat delivery, timeout detection (via `SIGSTOP`), manual promotion, data integrity across promotion |
+| `test_step8_backpressure_integration.py` | Bounded per-follower replication queue: writes never block on a stuck follower (via `SIGSTOP`), leader disconnects it on overflow, stays fully responsive afterward |
+| `test_step9_consistent_hash_ring` | `ConsistentHashRing`: deterministic hashing/assignment, distribution across shards, adding/removing a shard remaps only ~1/N of keys |
+| `test_step9_sharding_integration.py` | Router + two shard leaders: requests land on the correct shard, keys are partitioned (not duplicated), `PROMOTE` rejected, a dead shard yields a clear `ERROR` without affecting the other shard or crashing the Router |

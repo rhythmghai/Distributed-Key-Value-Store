@@ -20,6 +20,8 @@ add_library(kv_core
     src/tcp_server.cpp
     src/tcp_client.cpp
     src/replication_protocol.cpp
+    src/consistent_hash_ring.cpp
+    src/router_config.cpp
 )
 
 find_package(Threads REQUIRED)
@@ -59,11 +61,27 @@ target_link_libraries(test_step6_replication_protocol kv_core)
 add_executable(test_step7_protocol tests/test_step7_protocol.cpp)
 target_link_libraries(test_step7_protocol kv_core)
 
+# Step 9 unit test: ConsistentHashRing (pure logic, no sockets) --
+# deterministic key assignment, distribution across shards, and the
+# "adding/removing a shard only remaps ~1/N of keys" property.
+# End-to-end sharding (Router + multiple shard leaders) is verified
+# separately via tests/test_step9_sharding_integration.py.
+add_executable(test_step9_consistent_hash_ring tests/test_step9_consistent_hash_ring.cpp)
+target_link_libraries(test_step9_consistent_hash_ring kv_core)
+
 # Main node binary -- exposes a Node over TCP using the documented
 # client<->leader text protocol, and (if configured as a follower)
 # connects out to a leader for replication.
 add_executable(kv_node src/main.cpp)
 target_link_libraries(kv_node kv_core Threads::Threads)
+
+# Router binary: fronts multiple independent shard leader-groups behind
+# consistent hashing (Step 9). Reuses kv_core (ClientProtocolHandler,
+# TcpServer, TcpClient, socket_utils, ConsistentHashRing, RouterConfig)
+# -- no Node/replication code involved, since the Router only forwards
+# to each shard's already-existing leader.
+add_executable(router src/router_main.cpp)
+target_link_libraries(router kv_core Threads::Threads)
 
 # Main node binary -- not built yet, main.cpp doesn't exist until Node
 # (step 4) is implemented. Commented out until then.
