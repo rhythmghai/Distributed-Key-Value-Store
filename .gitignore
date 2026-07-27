@@ -1,0 +1,4 @@
+build/
+*.log
+data/*.wal
+.DS_Store
