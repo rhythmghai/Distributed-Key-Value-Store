@@ -37,7 +37,7 @@ void TcpServer::start() {
                                   std::to_string(port_) + ": " + strerror(errno));
     }
 
-    const int backlog = 16;
+    const int backlog = 128;
     if (listen(listenFd_, backlog) < 0) {
         close(listenFd_);
         throw std::runtime_error("TcpServer: listen() failed: " + std::string(strerror(errno)));
@@ -67,6 +67,16 @@ void TcpServer::acceptLoop() {
             continue; // transient accept error, keep serving
         }
 
+        if (activeConnections_->load() >= kMaxConnections) {
+            if (logger_ != nullptr) {
+                logger_->log(EventType::ERROR, "connection limit reached; rejecting fd=" +
+                                                   std::to_string(clientFd));
+            }
+            close(clientFd);
+            continue;
+        }
+        activeConnections_->fetch_add(1);
+
         if (logger_ != nullptr) {
             logger_->log(EventType::CLIENT_CONNECTED,
                           "fd=" + std::to_string(clientFd));
@@ -78,9 +88,11 @@ void TcpServer::acceptLoop() {
         // only has to worry about read/write, not socket cleanup.
         ConnectionHandler handlerCopy = handler_;
         Logger* loggerCopy = logger_;
-        std::thread([clientFd, handlerCopy, loggerCopy]() {
+        auto counter = activeConnections_;
+        std::thread([clientFd, handlerCopy, loggerCopy, counter]() {
             handlerCopy(clientFd);
             close(clientFd);
+            counter->fetch_sub(1);
             if (loggerCopy != nullptr) {
                 loggerCopy->log(EventType::CLIENT_DISCONNECTED,
                                  "fd=" + std::to_string(clientFd));

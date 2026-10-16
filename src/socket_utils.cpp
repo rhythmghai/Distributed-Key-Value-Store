@@ -21,6 +21,11 @@ bool readLine(int fd, std::string& outLine) {
             // Socket error (e.g. ECONNRESET).
             return false;
         }
+        if (outLine.size() >= kMaxLineBytes) {
+            // Unterminated oversized line: refuse to buffer it without
+            // bound. Caller treats this like a disconnect.
+            return false;
+        }
         if (c == '\n') {
             // Tolerate a trailing '\r' for CRLF-sending clients.
             if (!outLine.empty() && outLine.back() == '\r') {

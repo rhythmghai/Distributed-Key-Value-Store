@@ -14,6 +14,7 @@
 #include <fstream>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 
 namespace {
 
@@ -183,7 +184,82 @@ void testEmptyWalOnBrandNewNode() {
     std::cout << "PASS: brand-new node with empty WAL replays to zero entries, no crash\n";
 }
 
+// Regression: a torn final line used to be discarded on replay but left
+// in the file, so the next append was glued onto it and the following
+// replay silently dropped an acknowledged write.
+void testAppendAfterTornTailIsNotLost() {
+    std::cout << "\n--- Testing append after a torn tail survives another restart ---\n";
+    std::remove("/tmp/test_wal_7.log");
+    {
+        WriteAheadLog wal("/tmp/test_wal_7.log");
+        wal.append(makePut(1, "a", "1"));
+        wal.append(makePut(2, "b", "2"));
+    }
+    {
+        std::ofstream f("/tmp/test_wal_7.log", std::ios::app | std::ios::binary);
+        f << "3 PUT 1 c 1"; // torn: no value, no newline
+    }
+    {
+        WriteAheadLog wal("/tmp/test_wal_7.log");
+        assert(wal.replay().size() == 2);
+        wal.append(makePut(3, "d", "4"));
+    }
+    {
+        WriteAheadLog wal("/tmp/test_wal_7.log");
+        std::vector<LogEntry> entries = wal.replay();
+        assert(entries.size() == 3);
+        assert(entries[2].seq == 3 && entries[2].key == "d" && entries[2].value == "4");
+    }
+    std::cout << "PASS: write after torn tail was durable across restart\n";
+}
+
+// A final record that parses but lacks its newline was never
+// acknowledged (the newline is part of the same write) -- also torn.
+void testUnterminatedButParseableTailIsDiscarded() {
+    std::cout << "\n--- Testing parseable-but-unterminated tail is discarded ---\n";
+    std::remove("/tmp/test_wal_8.log");
+    {
+        WriteAheadLog wal("/tmp/test_wal_8.log");
+        wal.append(makePut(1, "a", "1"));
+    }
+    {
+        std::ofstream f("/tmp/test_wal_8.log", std::ios::app | std::ios::binary);
+        f << "2 PUT 1 b 1 2"; // complete record, missing '\n'
+    }
+    WriteAheadLog wal("/tmp/test_wal_8.log");
+    assert(wal.replay().size() == 1);
+    wal.append(makePut(2, "c", "3"));
+    WriteAheadLog again("/tmp/test_wal_8.log");
+    std::vector<LogEntry> entries = again.replay();
+    assert(entries.size() == 2 && entries[1].key == "c");
+    std::cout << "PASS\n";
+}
+
+void testCreatesMissingParentDirectory() {
+    std::cout << "\n--- Testing WAL creates a missing parent directory ---\n";
+    std::system("rm -rf /tmp/test_wal_dir_9");
+    WriteAheadLog wal("/tmp/test_wal_dir_9/nested/x.wal");
+    wal.append(makePut(1, "k", "v"));
+    assert(wal.replay().size() == 1);
+    std::cout << "PASS\n";
+}
+
+void testReadRangeIsBounded() {
+    std::cout << "\n--- Testing readRange(from, to) ---\n";
+    std::remove("/tmp/test_wal_10.log");
+    WriteAheadLog wal("/tmp/test_wal_10.log");
+    for (uint64_t i = 1; i <= 6; i++) wal.append(makePut(i, "k" + std::to_string(i), "v"));
+    std::vector<LogEntry> r = wal.readRange(2, 5);
+    assert(r.size() == 3 && r.front().seq == 3 && r.back().seq == 5);
+    assert(wal.readRange(6, 6).empty());
+    std::cout << "PASS\n";
+}
+
 int main() {
+    testAppendAfterTornTailIsNotLost();
+    testUnterminatedButParseableTailIsDiscarded();
+    testCreatesMissingParentDirectory();
+    testReadRangeIsBounded();
     testAppendAndReplaySameInstance();
     testCrashRecoveryAcrossInstances();
     testAppendPreservesExistingEntriesAfterRestart();
