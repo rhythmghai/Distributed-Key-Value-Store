@@ -7,6 +7,7 @@
 #include <vector>
 #include <mutex>
 #include <cstdio>
+#include <cstdint>
 
 // Append-only Write-Ahead Log.
 //
@@ -19,7 +20,8 @@
 // (e.g. the process crashed mid-write), that single trailing line is
 // discarded and a warning is logged -- everything before it is assumed
 // well-formed, per the Assumptions section (full corruption recovery is
-// out of scope).
+// out of scope). replay() also truncates the file back to the last
+// good byte so later appends never get glued onto the torn fragment.
 //
 // Catch-up contract: readFrom(seq) returns every entry with
 // seq > the given value, in ascending order -- this is what a leader
@@ -48,6 +50,13 @@ public:
     // Used by the leader to answer a follower's SYNC_REQUEST.
     std::vector<LogEntry> readFrom(uint64_t fromSeq);
 
+    // Like readFrom, but bounded above (fromSeq < seq <= toSeq) and
+    // lock-free with respect to append(): safe to call concurrently
+    // with writers as long as toSeq is a sequence number that has
+    // already been fully appended. Used for follower catch-up so the
+    // file scan doesn't block client writes.
+    std::vector<LogEntry> readRange(uint64_t fromSeq, uint64_t toSeq);
+
 private:
     std::string path_;
     Logger* logger_;
@@ -57,5 +66,9 @@ private:
     // Shared by replay() and readFrom(): reads every well-formed entry
     // from the start of the file, stopping (and logging) at the first
     // malformed/truncated line.
-    std::vector<LogEntry> readAllEntries();
+    // If validBytesOut is non-null it receives the byte length of the
+    // well-formed prefix. Stops early after the entry with
+    // seq >= stopAfterSeq.
+    std::vector<LogEntry> readAllEntries(uint64_t* validBytesOut = nullptr,
+                                          uint64_t stopAfterSeq = UINT64_MAX);
 };

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <exception>
 
 namespace {
 std::atomic<bool> g_shutdownRequested{false};
@@ -82,8 +83,16 @@ int main(int argc, char** argv) {
                         response = ClientProtocolHandler::formatError(
                             "writes not allowed on a follower; contact the leader");
                     } else {
-                        node.put(request.key, request.value);
-                        response = ClientProtocolHandler::formatOk();
+                        // A WAL I/O failure must fail this request, not
+                        // escape the detached connection thread (which
+                        // would std::terminate the whole node).
+                        try {
+                            node.put(request.key, request.value);
+                            response = ClientProtocolHandler::formatOk();
+                        } catch (const std::exception& e) {
+                            response = ClientProtocolHandler::formatError(
+                                std::string("write failed: ") + e.what());
+                        }
                     }
                     break;
                 }
@@ -99,8 +108,13 @@ int main(int argc, char** argv) {
                         response = ClientProtocolHandler::formatError(
                             "writes not allowed on a follower; contact the leader");
                     } else {
-                        node.remove(request.key);
-                        response = ClientProtocolHandler::formatOk();
+                        try {
+                            node.remove(request.key);
+                            response = ClientProtocolHandler::formatOk();
+                        } catch (const std::exception& e) {
+                            response = ClientProtocolHandler::formatError(
+                                std::string("write failed: ") + e.what());
+                        }
                     }
                     break;
                 }

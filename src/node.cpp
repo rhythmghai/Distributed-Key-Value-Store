@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <chrono>
+#include <algorithm>
 #include <sys/socket.h>
 
 namespace {
@@ -209,12 +210,22 @@ void Node::registerAndServeFollower(int followerFd, uint64_t followerLastSeq) {
     auto conn = std::make_shared<FollowerConnection>();
     conn->fd = followerFd;
 
+    // Under the lock, only snapshot the commit point and register the
+    // follower's queue (so every later write is queued for it). The
+    // potentially slow WAL scan happens after the lock is released, so
+    // a follower catching up never stalls client writes. Entries
+    // <= committedSeq come from the WAL; entries > committedSeq arrive
+    // via the queue -- no gap, no overlap.
+    uint64_t committedSeq;
     {
         std::lock_guard<std::mutex> lock(writeMutex_);
-        catchupEntries = wal_.readFrom(followerLastSeq);
+        committedSeq = nextSeq_ - 1;
 
         std::lock_guard<std::mutex> followersLock(followersMutex_);
         followers_.push_back(conn);
+    }
+    if (followerLastSeq < committedSeq) {
+        catchupEntries = wal_.readRange(followerLastSeq, committedSeq);
     }
 
     if (logger_ != nullptr) {
@@ -227,12 +238,14 @@ void Node::registerAndServeFollower(int followerFd, uint64_t followerLastSeq) {
     for (const auto& entry : catchupEntries) {
         if (!socket_utils::writeLine(followerFd, ReplicationProtocolHandler::formatRepl(entry))) {
             conn->alive = false;
+            removeFollower(conn);
             return;
         }
     }
     uint64_t replDoneSeq = catchupEntries.empty() ? followerLastSeq : catchupEntries.back().seq;
     if (!socket_utils::writeLine(followerFd, ReplicationProtocolHandler::formatReplDone(replDoneSeq))) {
         conn->alive = false;
+        removeFollower(conn);
         return;
     }
 
@@ -273,6 +286,10 @@ void Node::registerAndServeFollower(int followerFd, uint64_t followerLastSeq) {
         }
     }
 
+    removeFollower(conn);
+}
+
+void Node::removeFollower(const std::shared_ptr<FollowerConnection>& conn) {
     std::lock_guard<std::mutex> followersLock(followersMutex_);
     for (auto it = followers_.begin(); it != followers_.end(); ++it) {
         if (*it == conn) {
@@ -296,37 +313,62 @@ void Node::startFollowerReplication() {
 }
 
 void Node::runFollowerReplicationLoop() {
-    auto client = std::make_unique<TcpClient>(config_.leaderHost, config_.leaderPort);
+    // Outer loop: (re)connect -> sync -> stream, until promoted or shut
+    // down. A dropped connection (leader restart, or the leader
+    // disconnecting us for back-pressure) is just another outage: we
+    // reconnect and SYNC_REQUEST from our last-applied seq.
+    const int minBackoffMs = 200;
+    const int maxBackoffMs = 2000;
+    int backoffMs = minBackoffMs;
 
-    const int maxRetries = 30;
-    int attempt = 0;
-    while (followerThreadShouldRun_ && attempt < maxRetries) {
-        if (client->connect()) break;
-        attempt++;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
-    if (!client->isConnected()) {
-        if (logger_ != nullptr) {
-            logger_->log(EventType::ERROR, "follower could not connect to leader after retries");
+    // Sleeps in small slices so shutdown/promotion isn't delayed.
+    auto interruptibleSleep = [this](int ms) {
+        for (int slept = 0; slept < ms && followerThreadShouldRun_; slept += 50) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-        return;
+    };
+
+    while (followerThreadShouldRun_) {
+        auto client = std::make_unique<TcpClient>(config_.leaderHost, config_.leaderPort);
+        if (!client->connect()) {
+            interruptibleSleep(backoffMs);
+            backoffMs = std::min(backoffMs * 2, maxBackoffMs);
+            continue;
+        }
+        backoffMs = minBackoffMs;
+
+        // Reset liveness timer now, before the (possibly slow) catch-up
+        // handshake, so we don't spuriously time out before the first
+        // heartbeat has had a chance to arrive.
+        lastHeartbeatMillis_ = nowMillis();
+        heartbeatTimeoutLogged_ = false;
+
+        {
+            std::lock_guard<std::mutex> lock(leaderConnectionMutex_);
+            leaderConnection_ = std::move(client);
+        }
+
+        // The monitor outlives individual connections: if the leader
+        // goes away and stays away, it keeps measuring the silence.
+        if (!heartbeatMonitorThread_.joinable()) {
+            heartbeatMonitorShouldRun_ = true;
+            heartbeatMonitorThread_ = std::thread(&Node::runHeartbeatMonitorLoop, this);
+        }
+
+        runFollowerSession();
+
+        if (!followerThreadShouldRun_) break;
+        if (logger_ != nullptr && currentRole_.load() == NodeRole::FOLLOWER) {
+            logger_->log(EventType::ERROR,
+                         "follower lost connection to leader; reconnecting");
+        }
+        interruptibleSleep(backoffMs);
     }
 
-    // Reset liveness timer now, before the (possibly slow) catch-up
-    // handshake, so we don't spuriously time out before the first
-    // heartbeat has had a chance to arrive.
-    lastHeartbeatMillis_ = nowMillis();
-    heartbeatTimeoutLogged_ = false;
+    heartbeatMonitorShouldRun_ = false;
+}
 
-    {
-        std::lock_guard<std::mutex> lock(leaderConnectionMutex_);
-        leaderConnection_ = std::move(client);
-    }
-
-    // Start the heartbeat monitor now that we have a connection.
-    heartbeatMonitorShouldRun_ = true;
-    heartbeatMonitorThread_ = std::thread(&Node::runHeartbeatMonitorLoop, this);
-
+void Node::runFollowerSession() {
     uint64_t lastApplied;
     {
         std::lock_guard<std::mutex> lock(writeMutex_);
@@ -338,8 +380,9 @@ void Node::runFollowerReplicationLoop() {
     }
     {
         std::lock_guard<std::mutex> lock(leaderConnectionMutex_);
-        if (leaderConnection_) {
-            leaderConnection_->sendLine(ReplicationProtocolHandler::formatSyncRequest(lastApplied));
+        if (!leaderConnection_ ||
+            !leaderConnection_->sendLine(ReplicationProtocolHandler::formatSyncRequest(lastApplied))) {
+            return;
         }
     }
 
@@ -350,18 +393,19 @@ void Node::runFollowerReplicationLoop() {
         // (running on a different thread, e.g. handling a PROMOTE
         // client command) would deadlock trying to acquire the same
         // lock to close the connection and interrupt this exact call.
-        // The raw pointer stays valid for Node's lifetime; only the
-        // fd inside it gets closed by promoteToLeader(), which is what
-        // makes receiveLine() return false below.
+        // The raw pointer stays valid because only this thread ever
+        // replaces leaderConnection_ (and only between sessions); other
+        // threads merely close the fd inside it, which is what makes
+        // receiveLine() return false below.
         TcpClient* rawClient;
         {
             std::lock_guard<std::mutex> lock(leaderConnectionMutex_);
-            if (!leaderConnection_) break;
+            if (!leaderConnection_) return;
             rawClient = leaderConnection_.get();
         }
 
         bool gotLine = rawClient->receiveLine(line);
-        if (!gotLine) break; // disconnected (or force-closed by promoteToLeader())
+        if (!gotLine) return; // disconnected (or force-closed by promoteToLeader())
 
         ReplicationMessage msg = ReplicationProtocolHandler::parse(line);
 
@@ -384,14 +428,6 @@ void Node::runFollowerReplicationLoop() {
         } else if (logger_ != nullptr) {
             logger_->log(EventType::ERROR, "follower received unparseable replication message: " + line);
         }
-    }
-
-    heartbeatMonitorShouldRun_ = false;
-
-    if (logger_ != nullptr && currentRole_.load() == NodeRole::FOLLOWER) {
-        // If we were promoted, this is an expected/intentional
-        // disconnect, not a failure -- only log as an error otherwise.
-        logger_->log(EventType::ERROR, "follower lost connection to leader; replication loop exiting");
     }
 }
 

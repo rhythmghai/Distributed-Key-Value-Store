@@ -151,6 +151,7 @@ private:
     // same order they were committed locally.
     void replicateToFollowers(const LogEntry& entry);
     void runHeartbeatSenderLoop();
+    void removeFollower(const std::shared_ptr<FollowerConnection>& conn);
 
     // Shared enqueue path for both replicated writes and heartbeats, so
     // they get identical back-pressure handling instead of duplicating
@@ -183,7 +184,9 @@ private:
     std::mutex leaderConnectionMutex_;
     std::unique_ptr<TcpClient> leaderConnection_;
 
+    // Connect/reconnect loop; each connection runs one session.
     void runFollowerReplicationLoop();
+    void runFollowerSession();
     void runHeartbeatMonitorLoop();
 
     // Applies one replicated entry with strict-ordering + duplicate

@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <memory>
 
 // Raw POSIX-socket TCP server. Accepts connections on a fixed port and
 // spawns one detached thread per connection, each running the supplied
@@ -44,6 +45,13 @@ private:
     int listenFd_ = -1;
     std::thread acceptThread_;
     std::atomic<bool> running_{false};
+
+    // Cap on simultaneously-open connections (one thread each); excess
+    // connections are closed immediately instead of spawning unbounded
+    // threads. Shared_ptr because connection threads are detached and
+    // may briefly outlive the server object.
+    static constexpr int kMaxConnections = 1024;
+    std::shared_ptr<std::atomic<int>> activeConnections_ = std::make_shared<std::atomic<int>>(0);
 
     void acceptLoop();
 };

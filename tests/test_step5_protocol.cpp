@@ -8,6 +8,10 @@
 
 #include <iostream>
 #include <cassert>
+#include <thread>
+#include <sys/socket.h>
+#include <unistd.h>
+#include "socket_utils.h"
 
 void testParsePut() {
     std::cout << "\n--- Testing PUT parsing ---\n";
@@ -75,7 +79,38 @@ void testResponseFormatting() {
     std::cout << "PASS: all response formats match the documented wire protocol\n";
 }
 
+void testReadLineRejectsOversizedLine() {
+    std::cout << "\n--- Testing readLine() length cap ---\n";
+    int fds[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+
+    std::thread writer([&]() {
+        std::string chunk(64 * 1024, 'x');
+        size_t sent = 0;
+        while (sent <= socket_utils::kMaxLineBytes + chunk.size()) {
+            ssize_t n = send(fds[1], chunk.data(), chunk.size(), MSG_NOSIGNAL);
+            if (n <= 0) break; // reader gave up and closed
+            sent += static_cast<size_t>(n);
+        }
+        close(fds[1]);
+    });
+
+    std::string line;
+    assert(!socket_utils::readLine(fds[0], line));
+    close(fds[0]);
+    writer.join();
+
+    // And a normal line still works.
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    send(fds[1], "PUT a b\n", 8, 0);
+    assert(socket_utils::readLine(fds[0], line) && line == "PUT a b");
+    close(fds[0]);
+    close(fds[1]);
+    std::cout << "PASS: oversized unterminated line rejected, normal line accepted\n";
+}
+
 int main() {
+    testReadLineRejectsOversizedLine();
     testParsePut();
     testParsePutWithSpacesInValue();
     testParseGet();

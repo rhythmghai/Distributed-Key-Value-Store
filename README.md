@@ -53,7 +53,7 @@ lines were drawn, and why.
 ## Architecture
 
 ```
-distributed-kv-store/
+Distributed-Key-Value-Store/
 ├── CMakeLists.txt
 ├── config/                  # example node configs (leader/follower/single-node), plus
 │                             # shard leader configs and cluster.conf for the Router
@@ -210,7 +210,17 @@ needing to push an unrealistic amount of traffic through the OS's default
   or stale entries (`seq <= last_applied`) and out-of-order entries
   (`seq > next_expected`, i.e. a gap) rather than corrupting state.
 - A truncated/corrupt final WAL line (e.g. process killed mid-`fwrite`) is
-  detected and discarded on replay rather than crashing recovery.
+  detected on replay, discarded, and the file is truncated back to the last
+  good byte so later appends can't be glued onto the torn fragment. A
+  final record missing its newline is treated as torn even if it parses,
+  since an acknowledged write always includes its newline.
+- A follower whose connection to the leader drops (leader restart, or a
+  back-pressure disconnect) reconnects on its own with exponential backoff
+  (200ms up to 2s) and re-syncs from its last-applied sequence number.
+- Catch-up never blocks client writes: the leader only snapshots its commit
+  point and registers the follower's queue under the write lock; the WAL scan
+  happens outside it. (A very long catch-up under heavy write load can still
+  overflow the follower's bounded queue and be retried.)
 
 ## Sharding
 
@@ -308,7 +318,10 @@ shard keeps working normally.
   no mechanism to detect or resolve two nodes both believing they're leader.
   (A real system would use a term/epoch number, as Raft does, so a node can
   tell it's talking to a stale leader.)
-- No WAL compaction or snapshotting — the log grows unboundedly.
+- No WAL compaction or snapshotting — the log grows unboundedly, and
+  catch-up still scans the whole WAL file (no offset index).
+- Line reads are capped at 4 MiB and connections at 1024, but I/O is still
+  one `recv` per byte and one thread per connection (no epoll).
 - Single leader per shard; no multi-leader writes within a shard.
 - No TLS or authentication on any socket.
 - `PROMOTE` is exposed on the client-data port rather than a separate
@@ -429,5 +442,6 @@ python3 tests/test_step6_integration.py build/kv_node config/leader.conf config/
 | `test_step6_replication_protocol` + `test_step6_integration.py` | Leader↔follower replication, follower crash + catch-up, write rejection on followers |
 | `test_step7_protocol` + `test_step7_integration.py` | Heartbeat delivery, timeout detection (via `SIGSTOP`), manual promotion, data integrity across promotion |
 | `test_step8_backpressure_integration.py` | Bounded per-follower replication queue: writes never block on a stuck follower (via `SIGSTOP`), leader disconnects it on overflow, stays fully responsive afterward |
+| `test_reconnect_integration.py` | Follower auto-reconnects and catches up after the leader is `SIGKILL`ed and restarted, without restarting the follower |
 | `test_step9_consistent_hash_ring` | `ConsistentHashRing`: deterministic hashing/assignment, distribution across shards, adding/removing a shard remaps only ~1/N of keys |
 | `test_step9_sharding_integration.py` | Router + two shard leaders: requests land on the correct shard, keys are partitioned (not duplicated), `PROMOTE` rejected, a dead shard yields a clear `ERROR` without affecting the other shard or crashing the Router |

@@ -82,8 +82,3 @@ target_link_libraries(kv_node kv_core Threads::Threads)
 # to each shard's already-existing leader.
 add_executable(router src/router_main.cpp)
 target_link_libraries(router kv_core Threads::Threads)
-
-# Main node binary -- not built yet, main.cpp doesn't exist until Node
-# (step 4) is implemented. Commented out until then.
-# add_executable(kv_node src/main.cpp)
-# target_link_libraries(kv_node kv_core)

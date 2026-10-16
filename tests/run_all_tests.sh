@@ -164,6 +164,7 @@ run_integration_test test_step5_integration.py "$BUILD_DIR/kv_node" config/singl
 run_integration_test test_step6_integration.py "$BUILD_DIR/kv_node" config/leader.conf config/follower1.conf
 run_integration_test test_step7_integration.py "$BUILD_DIR/kv_node" config/leader.conf config/follower1.conf
 run_integration_test test_step8_backpressure_integration.py "$BUILD_DIR/kv_node" config/leader_backpressure.conf config/follower_backpressure.conf
+run_integration_test test_reconnect_integration.py "$BUILD_DIR/kv_node" config/leader.conf config/follower1.conf
 run_integration_test test_step9_sharding_integration.py "$BUILD_DIR/kv_node" "$BUILD_DIR/router" config/shard1.conf config/shard2.conf config/cluster.conf
 
 # ---------------------------------------------------------------------
