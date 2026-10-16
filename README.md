@@ -1,5 +1,7 @@
 # Distributed Key-Value Store
 
+[![CI](https://github.com/rhythmghai/Distributed-Key-Value-Store/actions/workflows/ci.yml/badge.svg)](https://github.com/rhythmghai/Distributed-Key-Value-Store/actions/workflows/ci.yml)
+
 A from-scratch distributed key-value store in C++17, built to demonstrate core
 distributed-systems concepts: durability via a write-ahead log, crash recovery,
 leader-follower replication, eventual consistency, heartbeat-based failure
@@ -413,6 +415,14 @@ GET name
 ```
 `GET`/`PUT`/`DELETE` against `localhost 9000` or `9010` directly show that
 the key only actually landed on one of the two shards.
+
+**Docker** (two shards behind a Router; shard-1 has a follower):
+```bash
+docker compose up --build
+nc localhost 8000     # Router; leaders on 9000/9010, shard-1 follower on 9001
+```
+Nodes resolve peers with `inet_pton` (no DNS), so the compose network uses
+fixed IPs (`172.28.0.0/24`) rather than service names; configs are in `docker/`.
 
 ## Testing
 
