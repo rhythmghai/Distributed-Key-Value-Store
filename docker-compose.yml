@@ -1,0 +1,44 @@
+# Two shards behind a Router: shard-1 = leader + follower, shard-2 = leader.
+#   docker compose up --build
+#   nc localhost 8000     # talk to the Router
+# Fixed IPs because the nodes resolve peers with inet_pton (no DNS).
+services:
+  shard1-leader:
+    build: .
+    command: ["kv_node", "/app/docker/shard1-leader.conf"]
+    volumes: ["shard1-leader-data:/app/data"]
+    ports: ["9000:9000"]
+    networks: { kvnet: { ipv4_address: 172.28.0.10 } }
+
+  shard1-follower:
+    build: .
+    command: ["kv_node", "/app/docker/shard1-follower.conf"]
+    volumes: ["shard1-follower-data:/app/data"]
+    ports: ["9001:9000"]
+    depends_on: [shard1-leader]
+    networks: { kvnet: { ipv4_address: 172.28.0.11 } }
+
+  shard2-leader:
+    build: .
+    command: ["kv_node", "/app/docker/shard2-leader.conf"]
+    volumes: ["shard2-leader-data:/app/data"]
+    ports: ["9010:9000"]
+    networks: { kvnet: { ipv4_address: 172.28.0.12 } }
+
+  router:
+    build: .
+    command: ["router", "/app/docker/cluster.conf"]
+    ports: ["8000:8000"]
+    depends_on: [shard1-leader, shard2-leader]
+    networks: { kvnet: { ipv4_address: 172.28.0.13 } }
+
+volumes:
+  shard1-leader-data:
+  shard1-follower-data:
+  shard2-leader-data:
+
+networks:
+  kvnet:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
